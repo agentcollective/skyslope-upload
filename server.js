@@ -19,7 +19,8 @@ const {
   SKYSLOPE_ACCESS_SECRET,
   WEBHOOK_SHARED_SECRET,
   DEFAULT_EMAIL_DOMAIN = "agentcollective.com",
-  DEFAULT_PHONE_AREA_CODE = "480"
+  DEFAULT_PHONE_AREA_CODE = "480",
+  DEBUG_SKYSLOPE = "true"
 } = process.env;
 
 let sessionCache = {
@@ -44,22 +45,26 @@ function normalizeName(firstName, lastName, fullName) {
   const full = cleanString(fullName);
 
   if (first && last) {
-    return { firstName: first, lastName: last, fullName: `${first} ${last}`.trim() };
+    return {
+      firstName: first,
+      lastName: last,
+      fullName: `${first} ${last}`.trim()
+    };
   }
 
   if (full) {
     const parts = full.replace(/\s+/g, " ").split(" ").filter(Boolean);
-    let firstName = parts[0] || "Unknown";
-    const lastName = parts.slice(1).join(" ") || "Client";
+    let resolvedFirst = parts[0] || "Unknown";
+    const resolvedLast = parts.slice(1).join(" ") || "Client";
 
-    if (firstName.toLowerCase() === "jeff") {
-      firstName = "Geoff";
+    if (resolvedFirst.toLowerCase() === "jeff") {
+      resolvedFirst = "Geoff";
     }
 
     return {
-      firstName,
-      lastName,
-      fullName: `${firstName} ${lastName}`.trim()
+      firstName: resolvedFirst,
+      lastName: resolvedLast,
+      fullName: `${resolvedFirst} ${resolvedLast}`.trim()
     };
   }
 
@@ -159,6 +164,15 @@ function buildSkySlopeAuthHeader() {
   };
 }
 
+function summarizeAxiosError(error) {
+  return {
+    message: error.message,
+    status: error.response?.status || null,
+    statusText: error.response?.statusText || null,
+    data: error.response?.data || null
+  };
+}
+
 async function getSkySlopeSession() {
   const now = Date.now();
 
@@ -191,7 +205,9 @@ async function getSkySlopeSession() {
   }
 
   sessionCache.token = session;
-  sessionCache.expiresAt = expiration ? new Date(expiration).getTime() : Date.now() + 110 * 60 * 1000;
+  sessionCache.expiresAt = expiration
+    ? new Date(expiration).getTime()
+    : Date.now() + 110 * 60 * 1000;
 
   return sessionCache.token;
 }
@@ -219,40 +235,175 @@ async function downloadFileAsBase64(url) {
   return Buffer.from(response.data).toString("base64");
 }
 
-async function uploadDocumentToSale(saleGuid, attachment) {
-  const base64Content = await downloadFileAsBase64(attachment.url);
-
-  const payload = {
-    fileName: attachment.fileName,
-    base64Content
-  };
-
-  return await skySlopeRequest("post", `/api/files/sales/${saleGuid}/documents`, payload);
+async function getSaleForm() {
+  return await skySlopeRequest("get", "/api/files/saleForm");
 }
 
-async function createPlaceholderSale() {
-  const payload = {
-    officeGuid: "GILBERT_PLACEHOLDER",
-    propertyType: "Residential",
-    subType: "Other",
-    transactionType: "Purchase",
-    stage: "PreContract",
-    saleType: "PassThrough"
+function pickFirst(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && value !== "") {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function extractFromCollection(collection, preferredLabels = []) {
+  if (!Array.isArray(collection)) return undefined;
+
+  for (const preferredLabel of preferredLabels) {
+    const found = collection.find(item => {
+      const label = String(
+        item?.label ||
+        item?.name ||
+        item?.text ||
+        item?.displayName ||
+        ""
+      ).toLowerCase();
+
+      return label.includes(preferredLabel.toLowerCase());
+    });
+
+    if (found) {
+      return pickFirst(
+        found.guid,
+        found.value,
+        found.id,
+        found.key,
+        found.officeGuid,
+        found.agentGuid,
+        found.checklistTypeId
+      );
+    }
+  }
+
+  const first = collection[0];
+  return pickFirst(
+    first?.guid,
+    first?.value,
+    first?.id,
+    first?.key,
+    first?.officeGuid,
+    first?.agentGuid,
+    first?.checklistTypeId
+  );
+}
+
+function buildSaleCreatePayloadFromForm(saleForm) {
+  const root = saleForm?.data || saleForm?.value || saleForm || {};
+
+  const officeGuid = pickFirst(
+    root.officeGuid,
+    root.office?.guid,
+    root.defaultOfficeGuid,
+    extractFromCollection(root.offices, ["gilbert"]),
+    extractFromCollection(root.officeOptions, ["gilbert"]),
+    extractFromCollection(root.availableOffices, ["gilbert"]),
+    extractFromCollection(root.officeList, ["gilbert"])
+  );
+
+  const agentGuid = pickFirst(
+    root.agentGuid,
+    root.agent?.guid,
+    root.defaultAgentGuid,
+    extractFromCollection(root.agents),
+    extractFromCollection(root.agentOptions),
+    extractFromCollection(root.availableAgents),
+    extractFromCollection(root.userOptions)
+  );
+
+  const checklistTypeId = pickFirst(
+    root.checklistTypeId,
+    root.checklistType?.id,
+    root.defaultChecklistTypeId,
+    extractFromCollection(root.checklistTypes),
+    extractFromCollection(root.checklistTypeOptions),
+    extractFromCollection(root.availableChecklistTypes)
+  );
+
+  const propertyType = pickFirst(
+    root.propertyType,
+    root.defaultPropertyType,
+    "Residential"
+  );
+
+  const subType = pickFirst(
+    root.subType,
+    root.subtype,
+    root.defaultSubType,
+    root.defaultSubtype,
+    "Other"
+  );
+
+  const transactionType = pickFirst(
+    root.transactionType,
+    root.defaultTransactionType,
+    "Purchase"
+  );
+
+  const stage = pickFirst(
+    root.stage,
+    root.defaultStage,
+    "PreContract"
+  );
+
+  const saleType = pickFirst(
+    root.saleType,
+    root.defaultSaleType,
+    "PassThrough"
+  );
+
+  return {
+    officeGuid,
+    agentGuid,
+    checklistTypeId,
+    propertyType,
+    subType,
+    transactionType,
+    stage,
+    saleType
   };
+}
+
+async function createSaleFromForm() {
+  const saleForm = await getSaleForm();
+  const payload = buildSaleCreatePayloadFromForm(saleForm);
+
+  const missing = [];
+  if (!payload.officeGuid) missing.push("officeGuid");
+  if (!payload.agentGuid) missing.push("agentGuid");
+  if (payload.checklistTypeId === undefined || payload.checklistTypeId === null || payload.checklistTypeId === "") {
+    missing.push("checklistTypeId");
+  }
+
+  if (missing.length) {
+    throw new Error(
+      `saleForm did not provide required values: ${missing.join(", ")}. Raw form: ${JSON.stringify(saleForm)}`
+    );
+  }
 
   const sale = await skySlopeRequest("post", "/api/files/sales", payload);
 
-  const saleGuid =
-    sale?.guid ||
-    sale?.saleGuid ||
-    sale?.id ||
-    sale?.data?.guid;
+  const saleGuid = pickFirst(
+    sale?.guid,
+    sale?.saleGuid,
+    sale?.id,
+    sale?.data?.guid,
+    sale?.data?.saleGuid,
+    sale?.value?.guid,
+    sale?.value?.saleGuid
+  );
 
   if (!saleGuid) {
     throw new Error(`Could not determine saleGuid from response: ${JSON.stringify(sale)}`);
   }
 
-  return saleGuid;
+  return {
+    saleGuid,
+    saleForm,
+    payload,
+    sale
+  };
 }
 
 async function addBuyerToSale(saleGuid, buyer) {
@@ -263,19 +414,52 @@ async function addBuyerToSale(saleGuid, buyer) {
     phoneNumber: buyer.phone
   };
 
-  try {
-    return await skySlopeRequest("post", `/api/files/sales/${saleGuid}/buyerContact`, payload);
-  } catch (err) {
-    console.warn("Buyer add failed, continuing:", err.response?.data || err.message);
-    return null;
-  }
+  return await skySlopeRequest("post", `/api/files/sales/${saleGuid}/buyerContact`, payload);
+}
+
+async function getAddDocumentsToSaleForm(saleGuid) {
+  return await skySlopeRequest("get", `/api/files/sales/${saleGuid}/addDocumentsToSaleForm`);
+}
+
+async function uploadDocumentToSale(saleGuid, attachment) {
+  await getAddDocumentsToSaleForm(saleGuid);
+
+  const base64Content = await downloadFileAsBase64(attachment.url);
+
+  const payload = {
+    fileName: attachment.fileName,
+    base64Content
+  };
+
+  return await skySlopeRequest("post", `/api/files/sales/${saleGuid}/documents`, payload);
 }
 
 app.get("/health", (req, res) => {
   res.json({ ok: true, message: "SkySlope middleware running" });
 });
 
+app.get("/auth-test", async (req, res) => {
+  try {
+    const session = await getSkySlopeSession();
+    res.json({
+      ok: true,
+      message: "SkySlope authentication successful",
+      sessionPreview: String(session).slice(0, 8) + "..."
+    });
+  } catch (error) {
+    console.error("SkySlope auth test failed:", error.response?.data || error.message);
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+      details: error.response?.data || null
+    });
+  }
+});
+
 app.post("/api/skyslope-upload", async (req, res) => {
+  const debug = [];
+  let saleGuid = null;
+
   try {
     const sharedSecret = req.headers["x-shared-secret"];
 
@@ -305,67 +489,97 @@ app.post("/api/skyslope-upload", async (req, res) => {
       email: cleanString(req.body.agentEmail)
     };
 
-    const attachments = normalizeAttachments(req.body.attachments);
+    const attachments = normalizeAttachments(
+      req.body.attachments || req.body.attachmentsJson
+    );
 
-    const saleGuid = await createPlaceholderSale();
+    debug.push({
+      step: "input-normalized",
+      clientFullName: buyer.fullName,
+      clientEmail: buyer.email,
+      clientPhone: buyer.phone,
+      agentFullName: agent.fullName,
+      agentEmail: agent.email,
+      attachmentCount: attachments.length
+    });
 
-    await addBuyerToSale(saleGuid, buyer);
+    const saleCreate = await createSaleFromForm();
+    saleGuid = saleCreate.saleGuid;
 
-    const uploaded = [];
-    for (const attachment of attachments) {
-      const result = await uploadDocumentToSale(saleGuid, attachment);
-      uploaded.push({
-        fileName: attachment.fileName,
-        uploaded: true,
-        result
+    debug.push({
+      step: "sale-created",
+      saleGuid,
+      payloadUsed: saleCreate.payload,
+      saleFormSample: DEBUG_SKYSLOPE === "true" ? saleCreate.saleForm : undefined
+    });
+
+    let buyerContactResult = null;
+    try {
+      buyerContactResult = await addBuyerToSale(saleGuid, buyer);
+      debug.push({
+        step: "buyer-added",
+        result: buyerContactResult
+      });
+    } catch (buyerError) {
+      debug.push({
+        step: "buyer-add-failed",
+        error: summarizeAxiosError(buyerError)
       });
     }
 
+    const uploaded = [];
+    for (const attachment of attachments) {
+      try {
+        const result = await uploadDocumentToSale(saleGuid, attachment);
+        uploaded.push({
+          fileName: attachment.fileName,
+          uploaded: true,
+          result
+        });
+      } catch (uploadError) {
+        uploaded.push({
+          fileName: attachment.fileName,
+          uploaded: false,
+          error: summarizeAxiosError(uploadError)
+        });
+      }
+    }
+
+    const uploadedSuccessCount = uploaded.filter(x => x.uploaded).length;
+    const uploadedFailCount = uploaded.filter(x => !x.uploaded).length;
+
     const summaryText =
-      `SkySlope upload successful. ` +
+      `SkySlope upload completed. ` +
       `Client: ${buyer.fullName}. ` +
       `Client email used: ${buyer.email}. ` +
       `Client phone used: ${buyer.phone}. ` +
       `Agent: ${agent.fullName || "Unknown Agent"} <${agent.email || "unknown"}>. ` +
-      `Attachments uploaded: ${uploaded.length}.`;
+      `Uploaded successfully: ${uploadedSuccessCount}. ` +
+      `Upload failures: ${uploadedFailCount}.`;
 
     return res.json({
-      ok: true,
+      ok: uploadedSuccessCount > 0,
       saleGuid,
       clientFullName: buyer.fullName,
       clientEmail: buyer.email,
       clientPhone: buyer.phone,
       agentFullName: agent.fullName,
       agentEmail: agent.email,
-      uploadedCount: uploaded.length,
+      uploadedCount: uploadedSuccessCount,
+      failedUploadCount: uploadedFailCount,
       uploaded,
-      summaryText
+      summaryText,
+      debug
     });
   } catch (error) {
     console.error("SkySlope upload failure:", error.response?.data || error.message);
 
     return res.status(500).json({
       ok: false,
+      saleGuid,
       error: error.message,
-      details: error.response?.data || null
-    });
-  }
-});
-
-app.get("/auth-test", async (req, res) => {
-  try {
-    const session = await getSkySlopeSession();
-    res.json({
-      ok: true,
-      message: "SkySlope authentication successful",
-      sessionPreview: String(session).slice(0, 8) + "..."
-    });
-  } catch (error) {
-    console.error("SkySlope auth test failed:", error.response?.data || error.message);
-    res.status(500).json({
-      ok: false,
-      error: error.message,
-      details: error.response?.data || null
+      details: error.response?.data || null,
+      debug
     });
   }
 });
