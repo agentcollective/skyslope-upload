@@ -28,9 +28,7 @@ const {
   DEFAULT_TC_PHONE = "6232290968",
   DEFAULT_TC_COMPANY = "",
 
-  DEFAULT_CHECKLIST_LABEL = "Residential - Traditional",
-  DEFAULT_PROPERTY_TYPE = "Residential",
-  DEFAULT_PROPERTY_SUBTYPE = "Other"
+  DEFAULT_CHECKLIST_TYPE_ID = "112821"
 } = process.env;
 
 let sessionCache = {
@@ -250,117 +248,6 @@ async function skySlopeRequest(method, path, data = null, params = null) {
   return response.data;
 }
 
-async function downloadFileAsBase64(url) {
-  const response = await axios.get(url, { responseType: "arraybuffer" });
-  return Buffer.from(response.data).toString("base64");
-}
-
-function safeLower(value) {
-  return String(value || "").toLowerCase();
-}
-
-function getFieldsArray(formResponse) {
-  return formResponse?.value?.fields || formResponse?.fields || formResponse?.data?.fields || [];
-}
-
-function fieldByName(formResponse, targetName) {
-  const fields = getFieldsArray(formResponse);
-  return fields.find(f => safeLower(f.fieldName) === safeLower(targetName));
-}
-
-function fieldSelections(formResponse, targetName) {
-  return fieldByName(formResponse, targetName)?.allowableSelections || [];
-}
-
-function findSelectionByLabel(selections, preferredLabels = []) {
-  if (!Array.isArray(selections)) return null;
-
-  for (const preferred of preferredLabels) {
-    const found = selections.find(item => {
-      const label = safeLower(
-        item?.sourceName ||
-        item?.name ||
-        item?.label ||
-        item?.text ||
-        item?.displayName ||
-        item?.value
-      );
-      return label.includes(safeLower(preferred));
-    });
-    if (found) return found;
-  }
-
-  return selections[0] || null;
-}
-
-function extractChecklistId(checklistResponse, preferredLabel) {
-  const root =
-    checklistResponse?.value ||
-    checklistResponse?.data ||
-    checklistResponse ||
-    {};
-
-  const all =
-    root?.checklistTypes ||
-    root?.items ||
-    root?.value ||
-    root?.results ||
-    [];
-
-  if (!Array.isArray(all)) {
-    return null;
-  }
-
-  const preferred = all.find(item => {
-    const name = safeLower(
-      item?.checklistTypeName ||
-      item?.name ||
-      item?.label ||
-      item?.text ||
-      item?.displayName
-    );
-    return name.includes(safeLower(preferredLabel));
-  });
-
-  const chosen = preferred || all[0];
-
-  if (!chosen) return null;
-
-  return {
-    checklistTypeId: pickFirst(
-      chosen?.checklistTypeId,
-      chosen?.id,
-      chosen?.value
-    ),
-    checklistTypeName: pickFirst(
-      chosen?.checklistTypeName,
-      chosen?.name,
-      chosen?.label,
-      chosen?.text,
-      chosen?.displayName
-    ),
-    raw: chosen
-  };
-}
-
-function extractCreateSaleRequirements(saleForm) {
-  const officeField = fieldByName(saleForm, "OfficeGuid");
-  const agentField = fieldByName(saleForm, "AgentGuid");
-  const checklistField = fieldByName(saleForm, "ChecklistTypeId");
-  const propertyField = fieldByName(saleForm, "Property");
-  const sourceField = fieldByName(saleForm, "SourceId");
-
-  return {
-    officeField,
-    agentField,
-    checklistField,
-    sourceField,
-    propertyField,
-    sourceSelections: sourceField?.allowableSelections || [],
-    propertySubFields: propertyField?.subFields || []
-  };
-}
-
 async function getSaleForm() {
   return await skySlopeRequest("get", "/api/files/saleForm");
 }
@@ -371,25 +258,21 @@ async function getChecklistTypesSingleOffice() {
   });
 }
 
-async function getChecklistTypesByOffice(officeGuid) {
-  return await skySlopeRequest("get", `/api/offices/${officeGuid}/checklistTypes`, null, {
-    transactionType: "Sale"
-  });
-}
-
 async function getContacts(query = {}) {
   return await skySlopeRequest("get", "/api/contacts", null, query);
 }
 
-async function getCurrentFilesSample() {
-  return await skySlopeRequest("get", "/api/files", null, {
-    type: "summary",
-    status: "active"
-  });
+async function getSales(params = {}) {
+  return await skySlopeRequest("get", "/api/files/sales", null, params);
 }
 
-function base64EncodeNumericId(value) {
-  return Buffer.from(String(value)).toString("base64");
+async function getSaleByGuid(saleGuid) {
+  return await skySlopeRequest("get", `/api/files/sales/${saleGuid}`);
+}
+
+async function downloadFileAsBase64(url) {
+  const response = await axios.get(url, { responseType: "arraybuffer" });
+  return Buffer.from(response.data).toString("base64");
 }
 
 app.get("/health", (req, res) => {
@@ -405,26 +288,6 @@ app.get("/auth-test", async (req, res) => {
       sessionPreview: String(session).slice(0, 8) + "..."
     });
   } catch (error) {
-    console.error("SkySlope auth test failed:", error.response?.data || error.message);
-    res.status(500).json({
-      ok: false,
-      error: error.message,
-      details: error.response?.data || null
-    });
-  }
-});
-
-app.get("/debug/sale-form", async (req, res) => {
-  try {
-    const saleForm = await getSaleForm();
-    const requirements = extractCreateSaleRequirements(saleForm);
-
-    res.json({
-      ok: true,
-      saleForm,
-      extracted: requirements
-    });
-  } catch (error) {
     res.status(500).json({
       ok: false,
       error: error.message,
@@ -435,16 +298,10 @@ app.get("/debug/sale-form", async (req, res) => {
 
 app.get("/debug/checklist-types", async (req, res) => {
   try {
-    const officeGuid = cleanString(req.query.officeGuid);
-    const result = officeGuid
-      ? await getChecklistTypesByOffice(officeGuid)
-      : await getChecklistTypesSingleOffice();
-
+    const result = await getChecklistTypesSingleOffice();
     res.json({
       ok: true,
-      officeGuid: officeGuid || null,
-      result,
-      extractedPreferred: extractChecklistId(result, DEFAULT_CHECKLIST_LABEL)
+      result
     });
   } catch (error) {
     res.status(500).json({
@@ -477,9 +334,17 @@ app.get("/debug/contacts", async (req, res) => {
   }
 });
 
-app.get("/debug/files-sample", async (req, res) => {
+app.get("/debug/sales", async (req, res) => {
   try {
-    const result = await getCurrentFilesSample();
+    const result = await getSales({
+      pageNumber: req.query.pageNumber || 1,
+      pageSize: req.query.pageSize || 10,
+      email: req.query.email || undefined,
+      status: req.query.status || "all",
+      createdByGuid: req.query.createdByGuid || undefined,
+      agentGuid: req.query.agentGuid || undefined
+    });
+
     res.json({
       ok: true,
       result
@@ -493,27 +358,18 @@ app.get("/debug/files-sample", async (req, res) => {
   }
 });
 
-app.get("/debug/decode-transaction-id", (req, res) => {
+app.get("/debug/sale/:saleGuid", async (req, res) => {
   try {
-    const encoded = cleanString(req.query.value);
-    if (!encoded) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing query param: value"
-      });
-    }
-
-    const decoded = Buffer.from(encoded, "base64").toString("utf8");
-
+    const result = await getSaleByGuid(req.params.saleGuid);
     res.json({
       ok: true,
-      encoded,
-      decoded
+      result
     });
   } catch (error) {
     res.status(500).json({
       ok: false,
-      error: error.message
+      error: error.message,
+      details: error.response?.data || null
     });
   }
 });
@@ -562,28 +418,20 @@ app.post("/api/skyslope-upload", async (req, res) => {
       clientPhone: buyer.phone,
       agentFullName: agent.fullName,
       agentEmail: agent.email,
-      attachmentCount: attachments.length
-    });
-
-    const saleForm = await getSaleForm();
-    const requirements = extractCreateSaleRequirements(saleForm);
-
-    debug.push({
-      step: "sale-form-fetched",
-      extracted: requirements
+      attachmentCount: attachments.length,
+      checklistTypeId: DEFAULT_CHECKLIST_TYPE_ID
     });
 
     return res.status(500).json({
       ok: false,
-      error: "Create flow not finalized yet. Use the new debug endpoints to discover OfficeGuid, AgentGuid, and ChecklistTypeId first.",
+      error: "Create flow not finalized yet. Next step is to discover OfficeGuid and AgentGuid via /debug/sales and /debug/sale/:saleGuid.",
       buyer,
       agent,
       attachmentCount: attachments.length,
+      checklistTypeId: DEFAULT_CHECKLIST_TYPE_ID,
       debug
     });
   } catch (error) {
-    console.error("SkySlope upload failure:", error.response?.data || error.message);
-
     return res.status(500).json({
       ok: false,
       error: error.message,
