@@ -253,10 +253,6 @@ async function downloadFileAsBase64(url) {
   return Buffer.from(response.data).toString("base64");
 }
 
-function base64EncodeNumericId(value) {
-  return Buffer.from(String(value)).toString("base64");
-}
-
 function todayLocalDateString() {
   const d = new Date();
   const year = d.getFullYear();
@@ -265,8 +261,8 @@ function todayLocalDateString() {
   return `${year}-${month}-${day}T00:00:00`;
 }
 
-async function createPreContractSale() {
-  const payload = {
+function buildCreateSalePayload(overrides = {}) {
+  return {
     officeGuid: DEFAULT_OFFICE_GUID,
     agentGuid: DEFAULT_AGENT_GUID,
     checklistTypeId: Number(DEFAULT_CHECKLIST_TYPE_ID),
@@ -292,11 +288,15 @@ async function createPreContractSale() {
       yearBuilt: null,
       realPropertyTypeId: Number(DEFAULT_PROPERTY_TYPE_ID),
       realPropertySubtypeId: Number(DEFAULT_PROPERTY_SUBTYPE_ID)
-    }
+    },
+
+    ...overrides
   };
+}
 
+async function createPreContractSale(payloadOverrides = {}) {
+  const payload = buildCreateSalePayload(payloadOverrides);
   const result = await skySlopeRequest("post", "/api/files/sales", payload);
-
   const sale = result?.value?.sale || result?.sale || result?.value || result;
   const saleGuid = sale?.saleGuid || result?.saleGuid || result?.id || null;
 
@@ -357,6 +357,10 @@ async function getSaleByGuid(saleGuid) {
   return await skySlopeRequest("get", `/api/files/sales/${saleGuid}`);
 }
 
+function okResponse(res, body) {
+  return res.status(200).json(body);
+}
+
 app.get("/health", (req, res) => {
   res.json({ ok: true, message: "SkySlope middleware running" });
 });
@@ -364,16 +368,43 @@ app.get("/health", (req, res) => {
 app.get("/auth-test", async (req, res) => {
   try {
     const session = await getSkySlopeSession();
-    res.json({
+    return okResponse(res, {
       ok: true,
       message: "SkySlope authentication successful",
       sessionPreview: String(session).slice(0, 8) + "..."
     });
   } catch (error) {
-    res.status(500).json({
+    return okResponse(res, {
       ok: false,
-      error: error.message,
-      details: error.response?.data || null
+      step: "auth-test",
+      error: summarizeAxiosError(error)
+    });
+  }
+});
+
+app.get("/debug/create-payload", (req, res) => {
+  return okResponse(res, {
+    ok: true,
+    payload: buildCreateSalePayload()
+  });
+});
+
+app.post("/debug/test-create-sale", async (req, res) => {
+  try {
+    const result = await createPreContractSale(req.body || {});
+    return okResponse(res, {
+      ok: true,
+      step: "create-sale",
+      saleGuid: result.saleGuid,
+      payload: result.payload,
+      result: result.result
+    });
+  } catch (error) {
+    return okResponse(res, {
+      ok: false,
+      step: "create-sale",
+      payloadTried: buildCreateSalePayload(req.body || {}),
+      error: summarizeAxiosError(error)
     });
   }
 });
@@ -386,8 +417,9 @@ app.post("/api/skyslope-upload", async (req, res) => {
     const sharedSecret = req.headers["x-shared-secret"];
 
     if (sharedSecret !== WEBHOOK_SHARED_SECRET) {
-      return res.status(401).json({
+      return okResponse(res, {
         ok: false,
+        step: "auth",
         error: "Unauthorized"
       });
     }
@@ -423,19 +455,29 @@ app.post("/api/skyslope-upload", async (req, res) => {
       attachmentCount: attachments.length
     });
 
-    const createResult = await createPreContractSale();
-    saleGuid = createResult.saleGuid;
-
-    debug.push({
-      step: "sale-created",
-      saleGuid,
-      payload: createResult.payload,
-      result: createResult.result
-    });
-
-    let buyerResult = null;
+    let createResult;
     try {
-      buyerResult = await addBuyerToSale(saleGuid, buyer);
+      createResult = await createPreContractSale();
+      saleGuid = createResult.saleGuid;
+      debug.push({
+        step: "sale-created",
+        saleGuid,
+        payload: createResult.payload,
+        result: createResult.result
+      });
+    } catch (createError) {
+      return okResponse(res, {
+        ok: false,
+        step: "create-sale",
+        saleGuid: null,
+        payloadTried: buildCreateSalePayload(),
+        error: summarizeAxiosError(createError),
+        debug
+      });
+    }
+
+    try {
+      const buyerResult = await addBuyerToSale(saleGuid, buyer);
       debug.push({
         step: "buyer-added",
         result: buyerResult
@@ -447,9 +489,8 @@ app.post("/api/skyslope-upload", async (req, res) => {
       });
     }
 
-    let commissionResult = null;
     try {
-      commissionResult = await updateSaleCommissions(saleGuid);
+      const commissionResult = await updateSaleCommissions(saleGuid);
       debug.push({
         step: "tc-updated",
         result: commissionResult
@@ -482,58 +523,36 @@ app.post("/api/skyslope-upload", async (req, res) => {
     const uploadedSuccessCount = uploaded.filter(x => x.uploaded).length;
     const uploadedFailCount = uploaded.filter(x => !x.uploaded).length;
 
-    let saleRecord = null;
-    let transactionIdEncoded = null;
-    let skySlopeLink = null;
-
+    let saleDetail = null;
     try {
-      const saleDetail = await getSaleByGuid(saleGuid);
-      saleRecord = saleDetail?.value?.sale || saleDetail?.sale || null;
-
-      const numericTransactionId =
-        saleRecord?.transactionId ||
-        saleRecord?.id ||
-        null;
-
-      if (numericTransactionId) {
-        transactionIdEncoded = base64EncodeNumericId(numericTransactionId);
-        skySlopeLink = `https://app.skyslope.com/TransactionChecklist.aspx?TransactionID=${transactionIdEncoded}`;
-      }
+      saleDetail = await getSaleByGuid(saleGuid);
+      debug.push({
+        step: "sale-detail",
+        result: saleDetail
+      });
     } catch (detailError) {
       debug.push({
-        step: "sale-detail-fetch-failed",
+        step: "sale-detail-failed",
         error: summarizeAxiosError(detailError)
       });
     }
 
-    const summaryText =
-      `SkySlope upload completed for ${buyer.fullName}. ` +
-      `Created pre-contract purchase file. ` +
-      `Uploaded ${uploadedSuccessCount} document(s). ` +
-      `Failed uploads: ${uploadedFailCount}.`;
-
-    return res.json({
-      ok: uploadedSuccessCount > 0 || !!saleGuid,
+    return okResponse(res, {
+      ok: true,
+      step: "complete",
       saleGuid,
-      skySlopeLink,
-      transactionIdEncoded,
-      clientFullName: buyer.fullName,
-      clientEmail: buyer.email,
-      clientPhone: buyer.phone,
-      agentFullName: agent.fullName,
-      agentEmail: agent.email,
       uploadedCount: uploadedSuccessCount,
       failedUploadCount: uploadedFailCount,
       uploaded,
-      summaryText,
+      summaryText: `SkySlope upload completed for ${buyer.fullName}. Created pre-contract purchase file. Uploaded ${uploadedSuccessCount} document(s). Failed uploads: ${uploadedFailCount}.`,
       debug
     });
   } catch (error) {
-    return res.status(500).json({
+    return okResponse(res, {
       ok: false,
+      step: "unhandled",
       saleGuid,
-      error: error.message,
-      details: error.response?.data || null,
+      error: summarizeAxiosError(error),
       debug
     });
   }
