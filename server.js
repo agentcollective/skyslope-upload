@@ -352,6 +352,24 @@ app.post("/api/skyslope-upload", async (req, res) => {
   }
 });
 
+app.get("/auth-test", async (req, res) => {
+  try {
+    const session = await getSkySlopeSession();
+    res.json({
+      ok: true,
+      message: "SkySlope authentication successful",
+      sessionPreview: String(session).slice(0, 8) + "..."
+    });
+  } catch (error) {
+    console.error("SkySlope auth test failed:", error.response?.data || error.message);
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+      details: error.response?.data || null
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
