@@ -187,6 +187,14 @@ function buildCreateSalePayload(overrides = {}) {
     sourceId: Number(DEFAULT_SOURCE_ID),
     otherSource: "Buyer Broker Upload Automation",
 
+    property: {
+      streetNumber: "0",
+      streetAddress: "PRE-CONTRACT BUYER - NO PROPERTY YET",
+      city: "Gilbert",
+      state: "AZ",
+      zip: "85234"
+    },
+
     ...overrides
   };
 }
