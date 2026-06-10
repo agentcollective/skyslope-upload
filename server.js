@@ -269,26 +269,10 @@ function buildCreateSalePayload(overrides = {}) {
 
     contractAcceptanceDate: todayLocalDateString(),
     salePrice: 0,
-    listingPrice: 0,
-    isOfficeLead: DEFAULT_IS_OFFICE_LEAD === "true",
+    isOfficeLead: false,
 
-    dealType: DEFAULT_DEAL_TYPE,
-    saleTypeId: Number(DEFAULT_SALE_TYPE_ID),
-
-    realPropertyType: DEFAULT_PROPERTY_TYPE,
-    realPropertySubtype: DEFAULT_PROPERTY_SUBTYPE,
-
-    property: {
-      streetNumber: "",
-      streetAddress: "",
-      unit: "",
-      city: "",
-      state: "",
-      zip: "",
-      yearBuilt: null,
-      realPropertyTypeId: Number(DEFAULT_PROPERTY_TYPE_ID),
-      realPropertySubtypeId: Number(DEFAULT_PROPERTY_SUBTYPE_ID)
-    },
+    sourceId: 131,
+    otherSource: "Buyer Broker Upload Automation",
 
     ...overrides
   };
